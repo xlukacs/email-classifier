@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.python-version
+report.json
+credentials.json
+token.json
+client_secret*.json
