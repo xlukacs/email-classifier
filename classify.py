@@ -21,7 +21,9 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
@@ -29,6 +31,7 @@ from email.header import decode_header
 from email.message import Message
 from html.parser import HTMLParser
 from pathlib import Path
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal, Sequence
 
 from typesafe_sdk import (
@@ -40,11 +43,13 @@ from typesafe_sdk import (
 )
 
 import gmail_api
+import store
 
 Decision = Literal["attention", "review", "skip"]
 
 BODY_CHAR_LIMIT = 8_000
-DEFAULT_CONCURRENCY = 8
+DEFAULT_CONCURRENCY = 16
+DEFAULT_FETCH_WORKERS = gmail_api.DEFAULT_FETCH_WORKERS
 DEFAULT_THRESHOLD = 0.40
 REVIEW_BAND = 0.08
 OPENROUTER_BASE_URL = "https://openrouter.ai/api"
@@ -246,6 +251,7 @@ class Email:
     body: str
     imap_uid: str | None = None
     gmail_id: str | None = None
+    thread_id: str | None = None
 
 
 @dataclass
@@ -268,6 +274,23 @@ class Classification:
     model: str
     input_tokens: int = 0
     error: str | None = None
+    cached: bool = False
+
+
+@dataclass
+class PipelineProgress:
+    phase: str = "starting"
+    listed: int = 0
+    listed_estimate: int = 0
+    listing_done: bool = False
+    fetched: int = 0
+    fetch_total: int = 0
+    done: int = 0
+    total: int = 0
+    current: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -275,6 +298,13 @@ class RunStats:
     model: str = ""
     input_tokens: int = 0
     results: list[Classification] = field(default_factory=list)
+    elapsed_ms: int = 0
+    concurrency: int = DEFAULT_CONCURRENCY
+    dry_run: bool = True
+    wrote_gmail: bool = False
+    would_star: int = 0
+    cached_count: int = 0
+    fresh_count: int = 0
 
 
 def load_dotenv_files() -> None:
@@ -505,7 +535,8 @@ def fetch_imap(
         raise SystemExit(f"Gmail search failed for {criteria}")
 
     uids = data[0].split() if data and data[0] else []
-    uids = uids[-limit:]
+    if limit > 0:
+        uids = uids[-limit:]
     emails: list[Email] = []
     for uid in uids:
         status, fetched = client.uid("fetch", uid, "(BODY.PEEK[])")
@@ -717,18 +748,56 @@ def resolve_openrouter_config() -> tuple[str, str]:
     return api_key, base_url or OPENROUTER_BASE_URL
 
 
-async def classify_all(
-    emails: Sequence[Email],
+async def classify_incoming(
+    emails: AsyncIterator[Email],
     *,
     model: str,
     threshold: float,
     concurrency: int,
+    on_result: Callable[[Classification, int, int], None] | None = None,
+    on_progress: Callable[[PipelineProgress], None] | None = None,
+    force: bool = False,
+    persist: bool = True,
+    cache: dict[str, Classification] | None = None,
+    progress: PipelineProgress | None = None,
 ) -> RunStats:
-    stats = RunStats()
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-    api_key, base_url = resolve_openrouter_config()
-    try:
-        async with AsyncTypeSafeClient(
+    stats = RunStats(concurrency=max(1, concurrency))
+    started = time.perf_counter()
+    progress = progress or PipelineProgress(phase="classifying")
+    cache = cache if cache is not None else {}
+    semaphore = asyncio.Semaphore(stats.concurrency)
+    lock = asyncio.Lock()
+    results_by_id: dict[str, Classification] = {}
+    order: list[str] = []
+    client_cm: Any = None
+    client: Any = None
+    pending: set[asyncio.Task[None]] = set()
+    max_pending = max(4, stats.concurrency * 4)
+
+    async def finish(item: Classification) -> None:
+        results_by_id[item.email.id] = item
+        async with lock:
+            progress.done += 1
+            if item.cached:
+                stats.cached_count += 1
+            else:
+                stats.fresh_count += 1
+            if item.model:
+                stats.model = item.model
+            progress.current = item.email.subject
+            done = progress.done
+            total = max(progress.total, done)
+        if on_result:
+            on_result(item, done, total)
+        if on_progress:
+            on_progress(progress)
+
+    async def ensure_client() -> Any:
+        nonlocal client, client_cm
+        if client is not None:
+            return client
+        api_key, base_url = resolve_openrouter_config()
+        client_cm = AsyncTypeSafeClient(
             api_key=api_key,
             base_url=base_url,
             model=model,
@@ -736,22 +805,241 @@ async def classify_all(
                 "HTTP-Referer": "https://github.com/email-classifier",
                 "X-OpenRouter-Title": "email-classifier",
             },
-        ) as client:
-            results = await asyncio.gather(
-                *(
-                    classify_one(
-                        client, message, threshold=threshold, semaphore=semaphore
-                    )
-                    for message in emails
-                )
+        )
+        client = await client_cm.__aenter__()
+        return client
+
+    async def handle(message: Email) -> None:
+        cached_item = None if force else cache.get(message.id)
+        if cached_item is None and not force:
+            cached_item = store.get_many([message.id], threshold=threshold).get(
+                message.id
             )
-    except TypeSafeError as exc:
-        raise SystemExit(f"OpenRouter / Jev client error: {exc}") from exc
-    stats.results = list(results)
+        if cached_item is not None:
+            await finish(cached_item)
+            return
+        item = await classify_one(
+            await ensure_client(),
+            message,
+            threshold=threshold,
+            semaphore=semaphore,
+        )
+        if persist:
+            store.save(item)
+        await finish(item)
+
+    try:
+        async for message in emails:
+            order.append(message.id)
+            progress.total = max(progress.total, progress.listed, len(order))
+            task = asyncio.create_task(handle(message))
+            pending.add(task)
+            if len(pending) >= max_pending:
+                done_set, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for finished in done_set:
+                    finished.result()
+        if pending:
+            await asyncio.gather(*pending)
+    finally:
+        if client_cm is not None:
+            await client_cm.__aexit__(None, None, None)
+
+    stats.results = [results_by_id[key] for key in order if key in results_by_id]
+    stats.elapsed_ms = int((time.perf_counter() - started) * 1000)
+    stats.would_star = sum(
+        1
+        for item in stats.results
+        if item.decision == "attention" and (item.email.gmail_id or item.email.imap_uid)
+    )
     if stats.results:
         stats.model = next((item.model for item in stats.results if item.model), model)
-        stats.input_tokens = sum(item.input_tokens for item in stats.results)
+        stats.input_tokens = sum(
+            item.input_tokens for item in stats.results if not item.cached
+        )
     return stats
+
+
+async def classify_all(
+    emails: Sequence[Email],
+    *,
+    model: str,
+    threshold: float,
+    concurrency: int,
+    on_result: Callable[[Classification, int, int], None] | None = None,
+    force: bool = False,
+    persist: bool = True,
+    on_progress: Callable[[PipelineProgress], None] | None = None,
+) -> RunStats:
+    progress = PipelineProgress(
+        phase="classifying",
+        listed=len(emails),
+        listing_done=True,
+        total=len(emails),
+    )
+
+    async def source() -> AsyncIterator[Email]:
+        for message in emails:
+            yield message
+            await asyncio.sleep(0)
+
+    cached_map = (
+        {}
+        if force
+        else store.get_many((message.id for message in emails), threshold=threshold)
+    )
+    return await classify_incoming(
+        source(),
+        model=model,
+        threshold=threshold,
+        concurrency=concurrency,
+        on_result=on_result,
+        on_progress=on_progress,
+        force=force,
+        persist=persist,
+        cache=cached_map,
+        progress=progress,
+    )
+
+
+async def run_gmail_pipeline(
+    *,
+    unread: bool,
+    limit: int,
+    since_days: int | None,
+    folder: str,
+    body_limit: int,
+    workers: int,
+    model: str,
+    threshold: float,
+    concurrency: int,
+    force: bool = False,
+    persist: bool = True,
+    skip_ids: set[str] | None = None,
+    on_result: Callable[[Classification, int, int], None] | None = None,
+    on_progress: Callable[[PipelineProgress], None] | None = None,
+) -> RunStats:
+    progress = PipelineProgress(phase="listing")
+    cache: dict[str, Classification] = {}
+    loop = asyncio.get_running_loop()
+    incoming: asyncio.Queue[Email | BaseException | None] = asyncio.Queue(maxsize=64)
+    skip = skip_ids or set()
+    state_lock = threading.Lock()
+    last_emit = 0.0
+
+    def bump(*, force_emit: bool = False) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if not force_emit and now - last_emit < 0.2:
+            return
+        last_emit = now
+        if not on_progress:
+            return
+        with state_lock:
+            snapshot = PipelineProgress(**progress.as_dict())
+        loop.call_soon_threadsafe(on_progress, snapshot)
+
+    def put_item(item: Email | BaseException | None) -> None:
+        asyncio.run_coroutine_threadsafe(incoming.put(item), loop).result(timeout=120)
+
+    def producer() -> None:
+        try:
+            service = gmail_api.gmail_service(interactive=True)
+            worker_count = max(1, min(int(workers), gmail_api.MAX_FETCH_WORKERS))
+
+            fetch_errors: list[BaseException] = []
+
+            def fetch_one(message_id: str) -> None:
+                try:
+                    raw = gmail_api.get_message(
+                        gmail_api._thread_service(), message_id, body_limit=body_limit
+                    )
+                    with state_lock:
+                        progress.fetched += 1
+                        progress.current = raw.get("subject") or ""
+                        if progress.phase == "listing":
+                            progress.phase = "running"
+                    bump()
+                    put_item(emails_from_fetched([raw])[0])
+                except (Exception, SystemExit) as exc:
+                    fetch_errors.append(exc)
+
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                for page, estimate in gmail_api.iter_message_id_pages(
+                    service,
+                    unread=unread,
+                    limit=limit,
+                    since_days=since_days,
+                    folder=folder,
+                ):
+                    ids = [item for item in page if item not in skip]
+                    with state_lock:
+                        progress.listed += len(ids)
+                        progress.total = progress.listed
+                        if estimate:
+                            progress.listed_estimate = max(
+                                progress.listed_estimate, int(estimate), progress.listed
+                            )
+                    if not force and ids:
+                        cache.update(store.get_many(ids, threshold=threshold))
+                    needed: list[str] = []
+                    for message_id in ids:
+                        cached_item = cache.get(message_id)
+                        if cached_item is not None:
+                            email = cached_item.email
+                            if not email.gmail_id:
+                                email.gmail_id = message_id
+                            put_item(email)
+                            continue
+                        needed.append(message_id)
+                    if needed:
+                        with state_lock:
+                            progress.fetch_total += len(needed)
+                            if progress.phase == "listing":
+                                progress.phase = "running"
+                        for message_id in needed:
+                            pool.submit(fetch_one, message_id)
+                    bump()
+                with state_lock:
+                    progress.listing_done = True
+                    if progress.phase == "listing":
+                        progress.phase = "classifying"
+                bump(force_emit=True)
+            if fetch_errors:
+                put_item(fetch_errors[0])
+                return
+            put_item(None)
+        except (Exception, SystemExit) as exc:
+            put_item(exc)
+
+    thread = threading.Thread(target=producer, name="gmail-fetch", daemon=True)
+    thread.start()
+
+    async def source() -> AsyncIterator[Email]:
+        while True:
+            item = await incoming.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    try:
+        return await classify_incoming(
+            source(),
+            model=model,
+            threshold=threshold,
+            concurrency=concurrency,
+            on_result=on_result,
+            on_progress=on_progress,
+            force=force,
+            persist=persist,
+            cache=cache,
+            progress=progress,
+        )
+    finally:
+        thread.join(timeout=5)
 
 
 def _color(enabled: bool, code: str, text: str) -> str:
@@ -805,13 +1093,28 @@ def render_text(stats: RunStats, *, color: bool) -> str:
         summary += f" · {stats.model}"
     if stats.input_tokens:
         summary += f" · {stats.input_tokens} input tokens"
+    if stats.elapsed_ms:
+        rate = len(stats.results) / (stats.elapsed_ms / 1000) if stats.elapsed_ms else 0
+        summary += f" · {stats.concurrency} workers · {rate:.1f}/s"
+    if stats.dry_run:
+        summary += " · dry-run"
+    if stats.cached_count:
+        summary += f" · {stats.cached_count} from sqlite"
     lines.append(_color(color, "1", summary))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def gmail_permalink(email: Email) -> str | None:
+    key = (email.thread_id or email.gmail_id or "").strip()
+    if not key or key.startswith("demo-"):
+        return None
+    return f"https://mail.google.com/mail/u/0/#all/{key}"
 
 
 def classification_dict(item: Classification) -> dict[str, Any]:
     payload = asdict(item)
     payload["email"] = asdict(item.email)
+    payload["gmail_url"] = gmail_permalink(item.email)
     return payload
 
 
@@ -839,7 +1142,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Classify every .eml file in this directory.",
     )
     parser.add_argument("--unread", action="store_true", help="Only unread inbox messages.")
-    parser.add_argument("--limit", type=int, default=25, help="Max messages to classify.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Max messages to classify. 0 = no cap (classify everything matched).",
+    )
     parser.add_argument(
         "--since-days",
         type=int,
@@ -861,7 +1169,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--concurrency",
         type=int,
         default=DEFAULT_CONCURRENCY,
-        help="Parallel Jev calls (default: 8).",
+        help="Parallel Jev workers (default: 16).",
     )
     parser.add_argument(
         "--model",
@@ -912,14 +1220,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Fall back to IMAP + App Password instead of the Gmail API.",
     )
+    parser.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=DEFAULT_FETCH_WORKERS,
+        help="Parallel Gmail API fetch threads (default: 4, capped at 8).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Classify only; never star, label, or otherwise modify Gmail.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore the SQLite cache and re-call Jev for every message.",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Open the live metrics dashboard (read-only unless you enable writes).",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Dashboard bind host (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Dashboard port (default: 8765).",
+    )
     return parser.parse_args(argv)
 
 
 def load_emails(args: argparse.Namespace) -> tuple[list[Email], imaplib.IMAP4_SSL | None]:
     if args.demo:
-        return sample_emails()[: args.limit], None
+        return take_limit(sample_emails(), args.limit), None
     if args.eml_dir:
-        return load_eml_dir(args.eml_dir)[: args.limit], None
+        return take_limit(load_eml_dir(args.eml_dir), args.limit), None
     if args.imap:
         client, emails = fetch_imap(
             unread=args.unread,
@@ -928,14 +1268,28 @@ def load_emails(args: argparse.Namespace) -> tuple[list[Email], imaplib.IMAP4_SS
             folder=args.folder,
         )
         return emails, client
-    messages = gmail_api.fetch_inbox(
+    emails = load_gmail_emails(
         unread=args.unread,
         limit=args.limit,
         since_days=args.since_days,
         folder=args.folder,
         body_limit=BODY_CHAR_LIMIT,
+        workers=getattr(args, "fetch_workers", DEFAULT_FETCH_WORKERS),
+        force=bool(getattr(args, "force", False)),
+        threshold=float(getattr(args, "threshold", DEFAULT_THRESHOLD)),
     )
-    emails = [
+    return emails, None
+
+
+def take_limit[T](items: Sequence[T], limit: int) -> list[T]:
+    values = list(items)
+    if limit <= 0:
+        return values
+    return values[:limit]
+
+
+def emails_from_fetched(messages: list[dict[str, str]]) -> list[Email]:
+    return [
         Email(
             id=item["id"],
             sender=item["from"],
@@ -944,10 +1298,48 @@ def load_emails(args: argparse.Namespace) -> tuple[list[Email], imaplib.IMAP4_SS
             subject=item["subject"],
             body=item["body"],
             gmail_id=item["id"],
+            thread_id=item.get("thread_id") or None,
         )
         for item in messages
     ]
-    return emails, None
+
+
+def load_gmail_emails(
+    *,
+    unread: bool,
+    limit: int,
+    since_days: int | None,
+    folder: str,
+    body_limit: int,
+    workers: int,
+    force: bool = False,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> list[Email]:
+    """List Gmail ids, reuse sqlite rows, and only GET bodies that are missing."""
+    service = gmail_api.gmail_service(interactive=True)
+    ids = gmail_api.list_message_ids(
+        service, unread=unread, limit=limit, since_days=since_days, folder=folder
+    )
+    if not ids:
+        return []
+    cached = {} if force else store.get_many(ids, threshold=threshold)
+    needed = [message_id for message_id in ids if message_id not in cached]
+    fetched = {
+        item["id"]: item
+        for item in gmail_api.fetch_messages(
+            needed, body_limit=body_limit, workers=workers
+        )
+    }
+    emails: list[Email] = []
+    for message_id in ids:
+        if message_id in cached:
+            email = cached[message_id].email
+            if not email.gmail_id:
+                email.gmail_id = message_id
+            emails.append(email)
+        elif message_id in fetched:
+            emails.extend(emails_from_fetched([fetched[message_id]]))
+    return emails
 
 
 def report_payload(stats: RunStats, threshold: float) -> dict[str, Any]:
@@ -972,35 +1364,97 @@ def print_report(stats: RunStats, args: argparse.Namespace) -> None:
 
 
 def run_once(args: argparse.Namespace, *, seen: set[str] | None = None) -> set[str]:
-    emails, imap_client = load_emails(args)
     processed = set(seen or ())
-    try:
-        if seen is not None:
-            emails = [item for item in emails if item.id not in processed]
-        if not emails:
-            if not args.json and seen is None:
-                print("No emails to classify.")
-            return processed
-        stats = asyncio.run(
-            classify_all(
-                emails,
-                model=args.model,
-                threshold=args.threshold,
-                concurrency=args.concurrency,
-            )
+    imap_client = None
+    use_gmail_pipeline = not args.demo and not args.eml_dir and not args.imap
+
+    def on_result(item: Classification, done: int, total: int) -> None:
+        if args.json or not sys.stderr.isatty():
+            return
+        print(
+            f"\rclassified {done}/{total} · {item.decision} · {item.email.subject[:48]}",
+            end="",
+            file=sys.stderr,
+            flush=True,
         )
+
+    def on_progress(update: PipelineProgress) -> None:
+        if args.json or not sys.stderr.isatty():
+            return
+        extra = f" · {update.current[:40]}" if update.current else ""
+        print(
+            f"\r{update.phase}  listed {update.listed}  "
+            f"dl {update.fetched}/{update.fetch_total}  "
+            f"classified {update.done}/{update.total}{extra}",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    try:
+        if use_gmail_pipeline:
+            try:
+                stats = asyncio.run(
+                    run_gmail_pipeline(
+                        unread=args.unread,
+                        limit=args.limit,
+                        since_days=args.since_days,
+                        folder=args.folder,
+                        body_limit=BODY_CHAR_LIMIT,
+                        workers=getattr(args, "fetch_workers", DEFAULT_FETCH_WORKERS),
+                        model=args.model,
+                        threshold=args.threshold,
+                        concurrency=args.concurrency,
+                        force=bool(args.force),
+                        skip_ids=processed if seen is not None else None,
+                        on_result=on_result,
+                        on_progress=on_progress,
+                    )
+                )
+            except TypeSafeError as exc:
+                raise SystemExit(f"OpenRouter / Jev client error: {exc}") from exc
+            if not stats.results:
+                if not args.json and seen is None:
+                    print("No emails to classify.")
+                return processed
+        else:
+            emails, imap_client = load_emails(args)
+            if seen is not None:
+                emails = [item for item in emails if item.id not in processed]
+            if not emails:
+                if not args.json and seen is None:
+                    print("No emails to classify.")
+                return processed
+            try:
+                stats = asyncio.run(
+                    classify_all(
+                        emails,
+                        model=args.model,
+                        threshold=args.threshold,
+                        concurrency=args.concurrency,
+                        on_result=on_result,
+                        force=bool(args.force),
+                    )
+                )
+            except TypeSafeError as exc:
+                raise SystemExit(f"OpenRouter / Jev client error: {exc}") from exc
+        if sys.stderr.isatty() and not args.json:
+            print(file=sys.stderr)
+        stats.dry_run = bool(args.dry_run or not args.flag)
         print_report(stats, args)
-        if args.flag:
-            gmail_ids = [
-                item.email.gmail_id
-                for item in stats.results
-                if item.email.gmail_id and item.decision == "attention"
-            ]
+        write_gmail = bool(args.flag) and not bool(args.dry_run)
+        gmail_ids = [
+            item.email.gmail_id
+            for item in stats.results
+            if item.email.gmail_id and item.decision == "attention"
+        ]
+        if write_gmail:
             if gmail_ids:
                 gmail_api.apply_attention_labels(
                     gmail_ids,
                     label=os.environ.get("GMAIL_LABEL", "Jev/Attention").strip(),
                 )
+                stats.wrote_gmail = True
             elif any(item.email.imap_uid for item in stats.results):
                 if imap_client is not None:
                     try:
@@ -1013,8 +1467,15 @@ def run_once(args: argparse.Namespace, *, seen: set[str] | None = None) -> set[s
                     apply_flags(
                         flag_client, stats.results, flag=True, folder=args.folder
                     )
+                    stats.wrote_gmail = True
                 finally:
                     flag_client.logout()
+        elif args.dry_run or args.flag:
+            print(
+                f"dry-run: would star {stats.would_star} message(s); "
+                "Gmail was not modified.",
+                file=sys.stderr if args.json else sys.stdout,
+            )
         processed.update(item.email.id for item in stats.results)
         return processed
     finally:
@@ -1030,6 +1491,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.login:
         gmail_api.login()
+        return 0
+    if args.dashboard:
+        from server import serve_dashboard
+
+        serve_dashboard(host=args.host, port=args.port)
         return 0
     if args.check_gmail:
         if args.imap:

@@ -7,4 +7,9 @@ __pycache__/
 report.json
 credentials.json
 token.json
-client_secret*.json
+web/node_modules/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+

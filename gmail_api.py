@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import base64
 import os
+import random
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -14,6 +19,19 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
+
+_thread_local = threading.local()
+DEFAULT_FETCH_WORKERS = 4
+MAX_FETCH_WORKERS = 8
+# messages.get is 20 units; new projects allow 6,000 units/user/minute.
+COST_MESSAGES_GET = 20
+COST_MESSAGES_LIST = 5
+COST_MESSAGES_MODIFY = 5
+COST_LABELS_LIST = 1
+COST_LABELS_GET = 1
+COST_LABELS_CREATE = 5
+COST_GET_PROFILE = 1
 
 CATEGORY_QUERIES = {
     "inbox": "in:inbox",
@@ -59,6 +77,97 @@ Gmail is connected with OAuth, not a password.
 Google will open a browser. Sign in with 2FA as usual. A token.json file is
 stored locally and refreshed automatically — your password is never saved.
 """.strip()
+
+
+def _units_per_second() -> float:
+    raw = os.environ.get("GMAIL_UNITS_PER_SEC", "80").strip() or "80"
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 80.0
+    return max(10.0, min(value, 90.0))
+
+
+class _QuotaLimiter:
+    """Stay under Gmail's per-user unit caps (6,000/min, 250/s burst)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tokens = 0.0
+        self._last = time.monotonic()
+
+    def acquire(self, units: int) -> None:
+        rate = _units_per_second()
+        need = max(1, int(units))
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last)
+                self._tokens = min(rate, self._tokens + elapsed * rate)
+                self._last = now
+                if self._tokens >= need:
+                    self._tokens -= need
+                    return
+                wait = (need - self._tokens) / rate
+            time.sleep(wait)
+
+    def pause(self, seconds: float) -> None:
+        delay = max(0.0, seconds)
+        with self._lock:
+            self._tokens = 0.0
+            self._last = time.monotonic() + delay
+        if delay:
+            time.sleep(delay)
+
+
+_limiter = _QuotaLimiter()
+
+
+def _is_rate_limit(exc: HttpError) -> bool:
+    if int(getattr(exc.resp, "status", 0) or 0) not in {403, 429}:
+        return False
+    try:
+        payload = exc.content.decode("utf-8", errors="replace").lower()
+    except Exception:
+        payload = str(exc).lower()
+    markers = (
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "quotaexceeded",
+        "quota exceeded",
+        "rate limit",
+        "total query cost",
+    )
+    return any(marker in payload for marker in markers)
+
+
+def _retry_after_seconds(exc: HttpError, attempt: int) -> float:
+    header = ""
+    try:
+        header = str(exc.resp.get("retry-after") or "").strip()
+    except Exception:
+        header = ""
+    if header:
+        try:
+            return min(90.0, max(1.0, float(header)))
+        except ValueError:
+            pass
+    return min(90.0, (2**attempt) * 8 + random.uniform(0.0, 4.0))
+
+
+def _execute(request: Any, *, units: int, attempts: int = 8) -> Any:
+    last: HttpError | None = None
+    for attempt in range(attempts):
+        _limiter.acquire(units)
+        try:
+            return request.execute()
+        except HttpError as exc:
+            last = exc
+            if not _is_rate_limit(exc) or attempt >= attempts - 1:
+                raise
+            _limiter.pause(_retry_after_seconds(exc, attempt))
+    assert last is not None
+    raise last
 
 
 class _HTMLText(HTMLParser):
@@ -160,6 +269,14 @@ def gmail_service(*, interactive: bool = True) -> Resource:
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _thread_service() -> Resource:
+    service = getattr(_thread_local, "gmail", None)
+    if service is None:
+        service = gmail_service(interactive=False)
+        _thread_local.gmail = service
+    return service
+
+
 def _header(payload: dict[str, Any], name: str) -> str:
     target = name.lower()
     for item in payload.get("headers") or []:
@@ -219,6 +336,51 @@ def _gmail_query(*, unread: bool, since_days: int | None, folder: str) -> str:
     return " ".join(terms)
 
 
+def iter_message_id_pages(
+    service: Resource,
+    *,
+    unread: bool,
+    limit: int,
+    since_days: int | None,
+    folder: str,
+):
+    """Yield (id_page, result_size_estimate) as Gmail list pages arrive."""
+    query = _gmail_query(unread=unread, since_days=since_days, folder=folder)
+    yielded = 0
+    page_token: str | None = None
+    uncapped = limit <= 0
+    while True:
+        remaining = None if uncapped else max(0, limit - yielded)
+        if remaining == 0:
+            return
+        page_size = 100 if remaining is None else min(100, remaining)
+        response = _execute(
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=page_size,
+                pageToken=page_token,
+            ),
+            units=COST_MESSAGES_LIST,
+        )
+        page: list[str] = []
+        for item in response.get("messages") or []:
+            page.append(item["id"])
+            yielded += 1
+            if not uncapped and yielded >= limit:
+                break
+        estimate = response.get("resultSizeEstimate")
+        if page:
+            yield page, int(estimate) if estimate is not None else None
+        if not uncapped and yielded >= limit:
+            return
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return
+
+
 def list_message_ids(
     service: Resource,
     *,
@@ -227,40 +389,22 @@ def list_message_ids(
     since_days: int | None,
     folder: str,
 ) -> list[str]:
-    query = _gmail_query(unread=unread, since_days=since_days, folder=folder)
     ids: list[str] = []
-    page_token: str | None = None
-    while len(ids) < limit:
-        request = (
-            service.users()
-            .messages()
-            .list(
-                userId="me",
-                q=query,
-                maxResults=min(100, limit - len(ids)),
-                pageToken=page_token,
-            )
-        )
-        response = request.execute()
-        for item in response.get("messages") or []:
-            ids.append(item["id"])
-            if len(ids) >= limit:
-                break
-        page_token = response.get("nextPageToken")
-        if not page_token:
-            break
+    for page, _estimate in iter_message_id_pages(
+        service, unread=unread, limit=limit, since_days=since_days, folder=folder
+    ):
+        ids.extend(page)
     return ids
 
 
 def get_message(service: Resource, message_id: str, *, body_limit: int) -> dict[str, str]:
-    raw = (
-        service.users()
-        .messages()
-        .get(userId="me", id=message_id, format="full")
-        .execute()
+    raw = _execute(
+        service.users().messages().get(userId="me", id=message_id, format="full"),
+        units=COST_MESSAGES_GET,
     )
     payload = raw.get("payload") or {}
     return {
+        "thread_id": str(raw.get("threadId") or ""),
         "id": str(raw.get("id") or message_id),
         "from": _header(payload, "From"),
         "to": _header(payload, "To"),
@@ -270,6 +414,31 @@ def get_message(service: Resource, message_id: str, *, body_limit: int) -> dict[
     }
 
 
+def fetch_messages(
+    ids: list[str],
+    *,
+    body_limit: int,
+    workers: int = DEFAULT_FETCH_WORKERS,
+) -> list[dict[str, str]]:
+    if not ids:
+        return []
+    worker_count = max(1, min(int(workers), len(ids), MAX_FETCH_WORKERS))
+    if worker_count == 1:
+        service = gmail_service(interactive=True)
+        return [get_message(service, message_id, body_limit=body_limit) for message_id in ids]
+
+    def one(message_id: str) -> dict[str, str]:
+        return get_message(_thread_service(), message_id, body_limit=body_limit)
+
+    by_id: dict[str, dict[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(one, message_id) for message_id in ids]
+        for future in as_completed(futures):
+            message = future.result()
+            by_id[message["id"]] = message
+    return [by_id[message_id] for message_id in ids if message_id in by_id]
+
+
 def fetch_inbox(
     *,
     unread: bool,
@@ -277,50 +446,75 @@ def fetch_inbox(
     since_days: int | None,
     folder: str,
     body_limit: int,
+    workers: int = DEFAULT_FETCH_WORKERS,
 ) -> list[dict[str, str]]:
     service = gmail_service(interactive=True)
     ids = list_message_ids(
         service, unread=unread, limit=limit, since_days=since_days, folder=folder
     )
-    return [get_message(service, message_id, body_limit=body_limit) for message_id in ids]
+    return fetch_messages(ids, body_limit=body_limit, workers=workers)
+
+
+def mailbox_snapshot() -> dict[str, Any]:
+    service = gmail_service(interactive=False)
+    profile = _execute(service.users().getProfile(userId="me"), units=COST_GET_PROFILE)
+    labels = _label_counts(service)
+    tabs: list[dict[str, Any]] = []
+    extras: list[dict[str, Any]] = []
+    shown: set[str] = set()
+    for label_id, title in SIDEBAR_LABELS:
+        raw = labels.get(label_id)
+        if not raw:
+            continue
+        shown.add(label_id)
+        tabs.append(
+            {
+                "id": label_id,
+                "name": title,
+                "unread": int(raw.get("messagesUnread") or 0),
+                "total": int(raw.get("messagesTotal") or 0),
+            }
+        )
+    for label_id, raw in labels.items():
+        if label_id in shown or raw.get("type") == "system":
+            continue
+        extras.append(
+            {
+                "id": label_id,
+                "name": str(raw.get("name") or label_id),
+                "unread": int(raw.get("messagesUnread") or 0),
+                "total": int(raw.get("messagesTotal") or 0),
+            }
+        )
+    extras.sort(key=lambda item: item["unread"], reverse=True)
+    return {
+        "address": profile.get("emailAddress", "(unknown)"),
+        "tabs": tabs,
+        "extras": extras[:12],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def check_connection() -> None:
-    service = gmail_service(interactive=True)
-    profile = service.users().getProfile(userId="me").execute()
-    address = profile.get("emailAddress", "(unknown)")
-    labels = _label_counts(service)
-    shown_ids: set[str] = set()
+    snap = mailbox_snapshot()
+    address = snap.get("address", "(unknown)")
     lines = [
         f"Connected to Gmail as {address} via OAuth (Gmail API).",
         "",
         f"{'':22} {'unread':>10}  {'total':>10}",
     ]
-    for label_id, title in SIDEBAR_LABELS:
-        raw = labels.get(label_id)
-        if not raw:
-            continue
-        shown_ids.add(label_id)
+    for tab in snap.get("tabs") or []:
         lines.append(
-            f"{title:22} {_format_count(raw.get('messagesUnread')):>10}  "
-            f"{_format_count(raw.get('messagesTotal')):>10}"
+            f"{str(tab['name']):22} {_format_count(tab.get('unread')):>10}  "
+            f"{_format_count(tab.get('total')):>10}"
         )
-
-    extras: list[tuple[int, str, dict[str, Any]]] = []
-    for label_id, raw in labels.items():
-        if label_id in shown_ids or raw.get("type") == "system":
+    for tab in snap.get("extras") or []:
+        if int(tab.get("unread") or 0) <= 0:
             continue
-        unread = int(raw.get("messagesUnread") or 0)
-        if unread <= 0:
-            continue
-        extras.append((unread, str(raw.get("name") or label_id), raw))
-    extras.sort(reverse=True)
-    for _, name, raw in extras[:12]:
         lines.append(
-            f"{name:22} {_format_count(raw.get('messagesUnread')):>10}  "
-            f"{_format_count(raw.get('messagesTotal')):>10}"
+            f"{str(tab['name']):22} {_format_count(tab.get('unread')):>10}  "
+            f"{_format_count(tab.get('total')):>10}"
         )
-
     lines.extend(
         [
             "",
@@ -334,7 +528,12 @@ def check_connection() -> None:
 
 
 def _label_counts(service: Resource) -> dict[str, dict[str, Any]]:
-    listed = service.users().labels().list(userId="me").execute().get("labels") or []
+    listed = (
+        _execute(service.users().labels().list(userId="me"), units=COST_LABELS_LIST).get(
+            "labels"
+        )
+        or []
+    )
     by_id: dict[str, dict[str, Any]] = {}
     extra_names = {
         "purchases",
@@ -352,8 +551,9 @@ def _label_counts(service: Resource) -> dict[str, dict[str, Any]]:
             wanted.add(label_id)
     for label_id in wanted:
         try:
-            by_id[label_id] = (
-                service.users().labels().get(userId="me", id=label_id).execute()
+            by_id[label_id] = _execute(
+                service.users().labels().get(userId="me", id=label_id),
+                units=COST_LABELS_GET,
             )
         except Exception:
             continue
@@ -373,11 +573,16 @@ def login() -> None:
 
 
 def _label_id(service: Resource, name: str) -> str:
-    existing = service.users().labels().list(userId="me").execute().get("labels") or []
+    existing = (
+        _execute(service.users().labels().list(userId="me"), units=COST_LABELS_LIST).get(
+            "labels"
+        )
+        or []
+    )
     for label in existing:
         if label.get("name") == name:
             return str(label["id"])
-    created = (
+    created = _execute(
         service.users()
         .labels()
         .create(
@@ -387,8 +592,8 @@ def _label_id(service: Resource, name: str) -> str:
                 "labelListVisibility": "labelShow",
                 "messageListVisibility": "show",
             },
-        )
-        .execute()
+        ),
+        units=COST_LABELS_CREATE,
     )
     return str(created["id"])
 
@@ -401,8 +606,11 @@ def apply_attention_labels(message_ids: list[str], *, label: str) -> None:
     if label:
         add.append(_label_id(service, label))
     for message_id in message_ids:
-        service.users().messages().modify(
-            userId="me",
-            id=message_id,
-            body={"addLabelIds": add},
-        ).execute()
+        _execute(
+            service.users().messages().modify(
+                userId="me",
+                id=message_id,
+                body={"addLabelIds": add},
+            ),
+            units=COST_MESSAGES_MODIFY,
+        )
