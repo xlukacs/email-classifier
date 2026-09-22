@@ -143,6 +143,28 @@ def saved_results(limit: int = 500) -> dict[str, Any]:
     }
 
 
+@app.get("/api/folders")
+def folders_progress() -> dict[str, Any]:
+    import store
+
+    classified = store.count_by_folder()
+    live: dict[str, Any] | None = None
+    for job in _jobs.values():
+        if job.get("status") != "running":
+            continue
+        metrics = _metrics(job)
+        live = {
+            "folder": metrics.get("folder") or "",
+            "fetched": metrics["fetched"],
+            "fetch_total": metrics["fetch_total"],
+            "done": metrics["done"],
+            "total": metrics["total"],
+            "phase": metrics["phase"],
+        }
+        break
+    return {"classified": classified, "live": live}
+
+
 @app.post("/api/jobs")
 async def start_job(body: ClassifyRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
@@ -302,6 +324,7 @@ async def _run_job(job: dict[str, Any], body: ClassifyRequest) -> None:
                 on_result=on_result,
                 on_progress=on_progress,
                 force=body.force,
+                folder=body.folder,
             )
         else:
             stats = await classify.run_gmail_pipeline(

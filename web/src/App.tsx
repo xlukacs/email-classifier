@@ -82,6 +82,18 @@ type Metrics = {
   model?: string
 }
 
+type FolderProgress = {
+  classified: Record<string, number>
+  live: {
+    folder: string
+    fetched: number
+    fetch_total: number
+    done: number
+    total: number
+    phase: string
+  } | null
+}
+
 const FOLDERS = [
   { id: "primary", label: "Primary", gmail: "CATEGORY_PERSONAL" },
   { id: "inbox", label: "Inbox", gmail: "INBOX" },
@@ -113,6 +125,9 @@ export default function App() {
   const [items, setItems] = useState<Classified[]>([])
   const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [jobError, setJobError] = useState<string | null>(null)
+  const [folderProgress, setFolderProgress] = useState<FolderProgress | null>(
+    null,
+  )
 
   async function refreshStats() {
     try {
@@ -141,10 +156,24 @@ export default function App() {
     }
   }
 
+  async function refreshFolders() {
+    try {
+      const response = await fetch("/api/folders")
+      if (!response.ok) return
+      setFolderProgress((await response.json()) as FolderProgress)
+    } catch {
+      /* progress is best-effort */
+    }
+  }
+
   useEffect(() => {
     void refreshStats()
     void loadSaved()
-    const id = window.setInterval(() => void refreshStats(), 15_000)
+    void refreshFolders()
+    const id = window.setInterval(() => {
+      void refreshStats()
+      void refreshFolders()
+    }, 15_000)
     return () => window.clearInterval(id)
   }, [])
 
@@ -193,11 +222,13 @@ export default function App() {
         setRunning(false)
         source.close()
         void refreshStats()
+        void refreshFolders()
       }
     }
     source.onerror = () => {
       setRunning(false)
       source.close()
+      void refreshFolders()
     }
   }
 
@@ -205,12 +236,14 @@ export default function App() {
     const map = new Map(
       (snapshot?.tabs ?? []).map((tab) => [tab.id, tab] as const),
     )
+    const classified = folderProgress?.classified ?? {}
     return FOLDERS.map((folderOption) => ({
       ...folderOption,
       unread: map.get(folderOption.gmail)?.unread ?? 0,
       total: map.get(folderOption.gmail)?.total ?? 0,
+      classified: classified[folderOption.id] ?? 0,
     }))
-  }, [snapshot])
+  }, [snapshot, folderProgress])
 
   const grouped = {
     attention: items.filter((item) => item.decision === "attention"),
@@ -250,23 +283,56 @@ export default function App() {
       </header>
 
       <section className="grid grid-cols-2 gap-px border-b border-white/10 bg-white/10 sm:grid-cols-3 lg:grid-cols-6">
-        {tabCounts.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setFolder(tab.id)}
-            className={cn(
-              "bg-desk px-4 py-4 text-left transition-colors hover:bg-rail",
-              folder === tab.id && "bg-rail",
-            )}
-          >
-            <div className="text-xs text-mute">{tab.label}</div>
-            <div className="font-display text-3xl leading-none text-lamp">
-              {fmt(tab.unread)}
-            </div>
-            <div className="mt-1 text-xs text-mute">{fmt(tab.total)} total</div>
-          </button>
-        ))}
+        {tabCounts.map((tab) => {
+          const pollLive = folderProgress?.live
+          const live =
+            running && metrics && metrics.folder === tab.id
+              ? metrics
+              : pollLive && pollLive.folder === tab.id
+                ? pollLive
+                : null
+          const done = live ? live.done : tab.classified
+          const denom = live ? Math.max(live.total, live.done) : tab.total
+          const barPct = denom > 0 ? Math.min(100, (done / denom) * 100) : 0
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setFolder(tab.id)}
+              className={cn(
+                "bg-desk px-4 py-4 text-left transition-colors hover:bg-rail",
+                folder === tab.id && "bg-rail",
+              )}
+            >
+              <div className="text-xs text-mute">{tab.label}</div>
+              <div className="font-display text-3xl leading-none text-lamp">
+                {fmt(tab.unread)}
+              </div>
+              <div className="mt-1 text-xs text-mute">
+                {fmt(tab.total)} total
+              </div>
+              <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className={cn(
+                    "h-full transition-[width]",
+                    live ? "bg-wax" : "bg-lamp/70",
+                  )}
+                  style={{ width: `${barPct}%` }}
+                />
+              </div>
+              <div className="mt-1 text-xs text-mute">
+                {live ? (
+                  <span className="tabular-nums">
+                    ↓ {fmt(live.fetched)}/{fmt(live.fetch_total)} · ✓{" "}
+                    {fmt(live.done)}/{fmt(live.total)}
+                  </span>
+                ) : (
+                  <>{fmt(tab.classified)} classified</>
+                )}
+              </div>
+            </button>
+          )
+        })}
       </section>
 
       <section className="flex flex-wrap items-center gap-4 border-b border-white/10 px-6 py-4">

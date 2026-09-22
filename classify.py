@@ -760,6 +760,7 @@ async def classify_incoming(
     persist: bool = True,
     cache: dict[str, Classification] | None = None,
     progress: PipelineProgress | None = None,
+    folder: str | None = None,
 ) -> RunStats:
     stats = RunStats(concurrency=max(1, concurrency))
     started = time.perf_counter()
@@ -825,7 +826,7 @@ async def classify_incoming(
             semaphore=semaphore,
         )
         if persist:
-            store.save(item)
+            store.save(item, folder=folder)
         await finish(item)
 
     try:
@@ -871,6 +872,7 @@ async def classify_all(
     force: bool = False,
     persist: bool = True,
     on_progress: Callable[[PipelineProgress], None] | None = None,
+    folder: str | None = None,
 ) -> RunStats:
     progress = PipelineProgress(
         phase="classifying",
@@ -900,6 +902,7 @@ async def classify_all(
         persist=persist,
         cache=cached_map,
         progress=progress,
+        folder=folder,
     )
 
 
@@ -1037,6 +1040,7 @@ async def run_gmail_pipeline(
             persist=persist,
             cache=cache,
             progress=progress,
+            folder=folder,
         )
     finally:
         thread.join(timeout=5)
@@ -1434,6 +1438,7 @@ def run_once(args: argparse.Namespace, *, seen: set[str] | None = None) -> set[s
                         concurrency=args.concurrency,
                         on_result=on_result,
                         force=bool(args.force),
+                        folder=args.folder,
                     )
                 )
             except TypeSafeError as exc:

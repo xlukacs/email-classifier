@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS classifications (
     is_spam_or_phishing REAL NOT NULL,
     model TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
-    classified_at TEXT NOT NULL
+    classified_at TEXT NOT NULL,
+    folder TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -56,6 +57,10 @@ def connect() -> sqlite3.Connection:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(classifications)")}
     if "thread_id" not in columns:
         conn.execute("ALTER TABLE classifications ADD COLUMN thread_id TEXT")
+    if "folder" not in columns:
+        conn.execute(
+            "ALTER TABLE classifications ADD COLUMN folder TEXT NOT NULL DEFAULT ''"
+        )
     return conn
 
 
@@ -126,7 +131,7 @@ def get_many(ids: Iterable[str], *, threshold: float) -> dict[str, Any]:
     return found
 
 
-def save(item: Any) -> None:
+def save(item: Any, *, folder: str | None = None) -> None:
     if item.error or item.cached:
         return
     with connect() as conn:
@@ -136,12 +141,14 @@ def save(item: Any) -> None:
                 id, gmail_id, thread_id, sender, to_addr, date, subject, body,
                 kind, kind_confidence, kind_probabilities, urgency, urgency_confidence,
                 expects_reply, action_required, from_real_person, time_sensitive,
-                is_marketing, is_spam_or_phishing, model, input_tokens, classified_at
+                is_marketing, is_spam_or_phishing, model, input_tokens, classified_at,
+                folder
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?,
+                ?
             )
             ON CONFLICT(id) DO UPDATE SET
                 gmail_id=excluded.gmail_id,
@@ -164,7 +171,8 @@ def save(item: Any) -> None:
                 is_spam_or_phishing=excluded.is_spam_or_phishing,
                 model=excluded.model,
                 input_tokens=excluded.input_tokens,
-                classified_at=excluded.classified_at
+                classified_at=excluded.classified_at,
+                folder=excluded.folder
             """,
             (
                 item.email.id,
@@ -189,6 +197,7 @@ def save(item: Any) -> None:
                 item.model,
                 item.input_tokens,
                 datetime.now(timezone.utc).isoformat(),
+                (folder or "").strip(),
             ),
         )
 
@@ -208,3 +217,13 @@ def count() -> int:
     with connect() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM classifications").fetchone()
     return int(row["n"] if row else 0)
+
+
+def count_by_folder() -> dict[str, int]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT folder, COUNT(*) AS n FROM classifications "
+            "WHERE folder IS NOT NULL AND folder != '' "
+            "GROUP BY folder"
+        ).fetchall()
+    return {str(row["folder"]): int(row["n"]) for row in rows}
